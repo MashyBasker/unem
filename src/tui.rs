@@ -64,7 +64,7 @@ impl App {
             let current_index = self.char_index;
             let from_left_to_current_index = current_index - 1;
             let before_char_to_delete = self.input.chars().take(from_left_to_current_index);
-            let after_char_to_delete = self.input.chars().skip(from_left_to_current_index);
+            let after_char_to_delete = self.input.chars().skip(current_index);
             self.input = before_char_to_delete.chain(after_char_to_delete).collect();
             self.move_cursor_left();
         }
