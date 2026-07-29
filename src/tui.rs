@@ -1,10 +1,22 @@
+use std::collections::VecDeque;
+
 use ratatui::crossterm::event::{self, KeyCode, KeyEventKind};
 use ratatui::layout::{Constraint, Layout, Position};
 use ratatui::style::{Color, Modifier, Style, Stylize};
-use ratatui::text::{Line, Text};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::Paragraph;
 use ratatui::{DefaultTerminal, Frame};
 use color_eyre::Result;
+
+// Cap scrollback like a terminal emulator so long sessions don't grow memory unbounded.
+const MAX_EXCHANGES: usize = 1000;
+
+const PROMPT_PREFIX: &str = "> ";
+
+struct Exchange {
+    prompt: String,
+    response: String,
+}
 
 pub struct App {
     // Value in the input box
@@ -13,8 +25,8 @@ pub struct App {
     char_index: usize,
     // Current input mode
     input_mode: InputMode,
-    // Message
-    message: String,
+    // History of completed prompt/response exchanges (oldest first)
+    history: VecDeque<Exchange>,
 }
 
 enum InputMode {
@@ -22,12 +34,17 @@ enum InputMode {
     Editing,
 }
 
+// Placeholder for real LLM integration — not implemented in this repo yet.
+fn generate_response(prompt: &str) -> String {
+    format!("\n{prompt}")
+}
+
 impl App {
     pub const fn new() -> Self {
         Self {
             input: String::new(),
             input_mode: InputMode::Normal,
-            message: String::new(),
+            history: VecDeque::new(),
             char_index: 0,
         }
     }
@@ -53,8 +70,12 @@ impl App {
     }
 
     fn submit_message(&mut self) {
-        self.message = self.input.clone();
-        self.input.clear();
+        let prompt = std::mem::take(&mut self.input);
+        let response = generate_response(&prompt);
+        self.history.push_back(Exchange { prompt, response });
+        if self.history.len() > MAX_EXCHANGES {
+            self.history.pop_front();
+        }
         self.reset_cursor();
     }
 
@@ -112,14 +133,41 @@ impl App {
         }
     }
 
-    fn render(&self, frame: &mut Frame) {
-        let layout = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(3),
-            Constraint::Min(1),
-        ]);
+    // Renders the transcript (past exchanges + the live input line, fenced by horizontal
+    // rules) as one scrolling buffer, so the input box always sits right after the latest
+    // output instead of occupying a fixed pane.
+    fn transcript_lines(&self, width: u16) -> Vec<Line<'_>> {
+        let mut lines = Vec::new();
+        for exchange in &self.history {
+            lines.push(Line::from(vec![
+                PROMPT_PREFIX.bold().fg(Color::Cyan),
+                exchange.prompt.as_str().into(),
+            ]));
+            for response_line in exchange.response.split('\n') {
+                lines.push(Line::from(response_line).fg(Color::Gray));
+            }
+            lines.push(Line::default());
+        }
 
-        let [help_area, input_area, message_area] = frame.area().layout(&layout);
+        let rule = Line::from("─".repeat(width as usize)).fg(Color::DarkGray);
+        let input_style = match self.input_mode {
+            InputMode::Normal => Style::default(),
+            InputMode::Editing => Style::default().fg(Color::Yellow),
+        };
+        lines.push(rule.clone());
+        lines.push(Line::from(vec![
+            PROMPT_PREFIX.bold().fg(Color::Cyan),
+            Span::styled(self.input.as_str(), input_style),
+        ]));
+        lines.push(rule);
+
+        lines
+    }
+
+    fn render(&self, frame: &mut Frame) {
+        let layout = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]);
+
+        let [help_area, transcript_area] = frame.area().layout(&layout);
 
         let (msg, style) = match self.input_mode {
             InputMode::Normal => (
@@ -147,22 +195,20 @@ impl App {
         let help_message = Paragraph::new(text);
         frame.render_widget(help_message, help_area);
 
-        let input = Paragraph::new(self.input.as_str())
-            .style(match self.input_mode {
-                InputMode::Normal => Style::default(),
-                InputMode::Editing => Style::default().fg(Color::Yellow),
-            })
-            .block(Block::bordered().title("Input"));
-        frame.render_widget(input, input_area);
-        match self.input_mode {
-            InputMode::Normal => {}
+        let lines = self.transcript_lines(transcript_area.width);
+        let line_count = lines.len() as u16;
+        let scroll = line_count.saturating_sub(transcript_area.height);
+        let transcript = Paragraph::new(lines).scroll((scroll, 0));
+        frame.render_widget(transcript, transcript_area);
 
-            InputMode::Editing => frame.set_cursor_position(Position::new(
-                input_area.x + self.char_index as u16 + 1,
-                input_area.y + 1,
-            )),
+        if matches!(self.input_mode, InputMode::Editing) {
+            // The live input line sits one row above the trailing rule.
+            let input_line_index = line_count.saturating_sub(2);
+            let visible_row = input_line_index.saturating_sub(scroll);
+            frame.set_cursor_position(Position::new(
+                transcript_area.x + PROMPT_PREFIX.len() as u16 + self.char_index as u16,
+                transcript_area.y + visible_row,
+            ));
         }
-
-        frame.render_widget(self.message.clone(), message_area);
     }
 }
